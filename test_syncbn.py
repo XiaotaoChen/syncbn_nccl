@@ -1,3 +1,5 @@
+import ctypes
+_=ctypes.CDLL("/mnt/truenas/scratch/xiaotao.chen/Repositories/mx_ops/additional.so")
 import mxnet as mx
 import numpy as np
 import pickle as pkl
@@ -58,18 +60,6 @@ def load_checkpoint(prefix, epoch):
             aux_params[name] = v
     return arg_params, aux_params
 
-def cal_np_mean_var(data):
-    gamma = np_gamma.reshape((1,2,1,1))
-    beta = np_beta.reshape((1,2,1,1))
-    mean = np.mean(data, axis=(0,2,3)).reshape((1,2,1,1))
-    var = np.var(data, axis=(0,2,3)).reshape((1,2,1,1))
-    print("mean:{}, var:{}".format(mean, var))
-
-    out = gamma * (data - mean)/(np.sqrt(var) + eps) - beta
-    print(out[0])
-    # with open("tmp_file/np_bn_output.pkl", "wb") as f:
-    #     pkl.dump(out, f)
-
 def bn_sym():
     data = mx.sym.Variable(name="data")
     bn = mx.sym.BatchNorm_v1(name="bn1", data=data, eps=eps, fix_gamma=False)
@@ -87,8 +77,8 @@ def syncbn_sym(ndev=1):
     data = mx.sym.Variable(name="data")
     # bn = mx.sym.contrib.SyncBatchNorm(name="bn1", data=data, eps=eps, fix_gamma=False, key="syncbn1", ndev=ndev)
     # bn = mx.sym.contrib.SyncBatchNorm(name="bn2", data=bn, eps=eps, fix_gamma=False, key="syncbn2", ndev=ndev)
-    bn = mx.sym.contrib.SyncBatchNormV2(name="bn1", data=data, eps=eps, fix_gamma=False, key="syncbn1", ndev=ndev)
-    bn = mx.sym.contrib.SyncBatchNormV2(name="bn2", data=bn, eps=eps, fix_gamma=False, key="syncbn2", ndev=ndev)
+    bn = mx.sym.contrib.SyncBatchNormV3(name="bn1", data=data, eps=eps, fix_gamma=False, key="syncbn1", ndev=ndev)
+    bn = mx.sym.contrib.SyncBatchNormV3(name="bn2", data=bn, eps=eps, fix_gamma=False, key="syncbn2", ndev=ndev)
     flat = mx.sym.Flatten(data=bn, name="flatten1")
     sym = mx.sym.SoftmaxOutput(data=flat, name="softmax")
 
@@ -99,22 +89,22 @@ def syncbn_sym(ndev=1):
     return mx.sym.Group([bn_out, bn2_out, sym])
 
 
-def test_symbol(bnop, ndev=1):
+def test_symbol(bnop, ndev=1, bn_type="local", debug=False):
     input_data = mx.sym.Variable(name="data")
     conv1 = mx.sym.Convolution(data=input_data, num_filter=16, kernel=(3, 3), stride=(1, 1),
                                    pad=(1, 1), no_bias=True, name = 'conv1')
-    if bnop == mx.sym.contrib.SyncBatchNormV2 or bnop == mx.sym.contrib.SyncBatchNorm or bnop == mx.sym.contrib.SyncBatchNormV3:
-        bn1 = bnop(data=conv1, fix_gamma=False, eps=1e-5, momentum=0.9, name='bn1', key="bn1", ndev=ndev)
-    else:   
+    if bn_type=="local":   
         bn1 = bnop(data=conv1, fix_gamma=False, eps=1e-5, momentum=0.9, name='bn1')
+    else:
+        bn1 = bnop(data=conv1, fix_gamma=False, eps=1e-5, momentum=0.9, name='bn1', key="bn1", ndev=ndev, debug=debug)
     act1 = mx.sym.Activation(data=bn1, act_type='relu', name='relu1')
 
     conv2 = mx.sym.Convolution(data=act1, num_filter=8, kernel=(3, 3), stride=(1, 1),
                                    pad=(1, 1), no_bias=True, name = 'conv2')
-    if bnop == mx.sym.contrib.SyncBatchNormV2 or bnop == mx.sym.contrib.SyncBatchNorm or bnop == mx.sym.contrib.SyncBatchNormV3:
-        bn2 = bnop(data=conv2, fix_gamma=False, eps=1e-5, momentum=0.9, name='bn2', key="bn2", ndev=ndev)
-    else:
+    if bn_type == "local":
         bn2 = bnop(data=conv2, fix_gamma=False, eps=1e-5, momentum=0.9, name='bn2')
+    else:
+        bn2 = bnop(data=conv2, fix_gamma=False, eps=1e-5, momentum=0.9, name='bn2', key="bn2", ndev=ndev, debug=debug)
     act2 = mx.sym.Activation(data=bn2, act_type='relu', name='relu2')
 
     flatten = mx.sym.Flatten(data=act2)
@@ -139,13 +129,15 @@ def mx_bn(data):
     # sym = syncbn_sym(ndev)
     # ctx = mx.gpu()
     # sym = bn_sym()
-
-    # bnop = mx.sym.BatchNorm
-    # bnop = mx.sym.BatchNorm_v1
-    # bnop = mx.sym.contrib.SyncBatchNorm
-    # bnop = mx.sym.contrib.SyncBatchNormV2
-    bnop = mx.sym.contrib.SyncBatchNormV3
-    sym = test_symbol(bnop=bnop, ndev=ndev)
+    bn_type = "sync"
+    debug = False
+    if bn_type == "local":
+        bnop = mx.sym.BatchNorm
+        # bnop = mx.sym.BatchNorm_v1
+    else:
+        # bnop = mx.sym.contrib.SyncBatchNorm
+        bnop = mx.sym.contrib.SyncBatchNormV3
+    sym = test_symbol(bnop=bnop, ndev=ndev, bn_type=bn_type, debug=debug)
 
     mod = mx.mod.Module(symbol=sym, context=ctx, data_names=data_names)
     mod.bind(for_training=True, data_shapes=mx_data_shape, label_shapes=mx_label_shape)
@@ -163,11 +155,11 @@ def mx_bn(data):
         mod.forward(mx_data_batch)
         mod.backward()
         mod.update()
-        # mx.nd.waitall()
-    outputs = mod.get_outputs()
-    out = outputs[0].asnumpy()
-    print("forward idx:{}, output:{}".format(idx, out[0]))
-    mx.nd.waitall()
+        mx.nd.waitall()
+        outputs = mod.get_outputs()
+        out = outputs[0].asnumpy()
+        print("forward idx:{}, output:{}".format(idx, out[0]))
+    # mx.nd.waitall()
     # arg_params, aux_params = mod.get_params()
     # mx.model.save_checkpoint("testsym_syncbnv28d_10iter", 0, sym, arg_params, aux_params)
 
@@ -191,7 +183,5 @@ def check_correct():
     np.testing.assert_almost_equal(src_data, dst_data, decimal=5)
 
 if __name__ == "__main__":
-    # cal_np_mean_var(data)
     mx_bn(data)
     # check_correct()
-    # test_batchnorm()

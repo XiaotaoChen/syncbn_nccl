@@ -35,8 +35,10 @@
 #include <string>
 #include <utility>
 #include <queue>
-#include "../operator_common.h"
-#include "../mshadow_op.h"
+// #include "../operator_common.h"
+// #include "../mshadow_op.h"
+#include "operator_common.h"
+#include "mshadow_op.h"
 
 #include "nccl.h"
 
@@ -58,6 +60,7 @@ struct SyncBatchNormV3Param : public dmlc::Parameter<SyncBatchNormV3Param> {
   bool output_mean_var;
   int ndev;
   std::string key;
+  bool debug;
   DMLC_DECLARE_PARAMETER(SyncBatchNormV3Param) {
     DMLC_DECLARE_FIELD(eps).set_default(1e-3f)
     .describe("Epsilon to prevent div 0");
@@ -76,6 +79,9 @@ struct SyncBatchNormV3Param : public dmlc::Parameter<SyncBatchNormV3Param> {
       .set_default("")
       .describe("Hash key for synchronization, please set the same hash key for same layer, "
                 "Block.prefix is typically used as in :class:`gluon.nn.contrib.SyncBatchNormV3`.");
+    DMLC_DECLARE_FIELD(debug)
+      .set_default(false)
+      .describe("debug mode or not");
   }
 };
 
@@ -111,65 +117,33 @@ public:
     }
 };
 
-
-template<typename T>
-class SafeQueue
-{
-private:
-    std::queue<T> q;
-    std::mutex mtx;
-public:
-    SafeQueue(){}
-    ~SafeQueue(){}
-    void enqueue(const T& t) {
-        std::lock_guard<std::mutex> lck(mtx);
-        q.emplace(t);
-    }
-    bool dequeue(T& t) {
-        std::lock_guard<std::mutex> lck(mtx);
-        if (q.empty()) return false;
-        t = std::move(q.front()); q.pop();
-        return true;
-    }
-
-    T& front() {
-      std::lock_guard<std::mutex> lck(mtx);
-      return q.front();
-    }
-
-    bool empty() {
-        std::lock_guard<std::mutex> lck(mtx);
-        return q.empty();
-    }
-
-    int size() {
-        std::lock_guard<std::mutex> lck(mtx);
-        return q.size();
-    }
-
-    void clear() {
-        std::lock_guard<std::mutex> lck(mtx);
-        std::queue<T> empty;
-        std::swap(q, empty);
-        return ;
-    }
-};
+template<typename DType>
+void print_result(DType* buff, int size, std::string name) {
+  float* h_buff = new float[size];
+  CUDACHECK(cudaMemcpy(h_buff, buff, sizeof(DType) * size, cudaMemcpyDeviceToHost));
+  std::cout << name << "buff size: " << size << std::endl;
+  for (int i=0; i<size; i++) {
+    std::cout << h_buff[i] << " ";
+  }
+  std::cout << std::endl;
+  delete[] h_buff;
+}
 
 class Globalcomm {
 private:
     int ndev;
     ncclUniqueId uid;
     std::vector<ncclComm_t> comms;
-    std::vector<cudaStream_t> streams;
+    // std::vector<cudaStream_t> streams;
     std::vector<bool> inited;
     // mutexs for threads on per device
     std::mutex* mutexs;
 
     std::mutex rc_mutex;
-    std::condition_variable cv;
     std::map<std::string, int> ready_counts;
 
-    SafeQueue<std::string> sq;
+    std::queue<std::string> sq;
+    std::condition_variable cv;
 
 public:
     Globalcomm(int ndev): ndev(ndev) {
@@ -177,7 +151,7 @@ public:
         ncclGetUniqueId(&uid);
         inited = std::vector<bool>(ndev, false);
         comms = std::vector<ncclComm_t>(ndev);
-        streams = std::vector<cudaStream_t>(ndev);
+        // streams = std::vector<cudaStream_t>(ndev);
         mutexs = new std::mutex[ndev];
     }
     
@@ -196,19 +170,21 @@ public:
         return device_id;
     }
 
-    void init(int device_id) {
+    bool init(int device_id) {
+        if (device_id == 0) std::cout << "check init\n";
         // int device_id = get_device_id();
         std::lock_guard<std::mutex> lck(mutexs[device_id]);
         if (!inited[device_id]) {
             std::cout << "comm init: " << device_id << "/"<< ndev << std::endl;
-            CUDACHECK(cudaSetDevice(device_id));
-            CUDACHECK(cudaStreamCreate(&streams[device_id]));
+            // CUDACHECK(cudaSetDevice(device_id));
+            // CUDACHECK(cudaStreamCreate(&streams[device_id]));
             NCCLCHECK(ncclCommInitRank(&comms[device_id], ndev, uid, device_id));
             inited[device_id] = true;
         }
+        return true;
     }
 
-    void reduce(float* buff, int size, std::string key, int device_id) {
+    void reduce(float* buff, int size, std::string key, int device_id, cudaStream_t stream) {
         // int device_id = get_device_id();
         // be care of the scope of mutex, ensure rc_mutex is unlocked, when call notify all
         {
@@ -217,7 +193,7 @@ public:
                 ready_counts[key] = ndev;
             }
             if (--ready_counts[key]==0) {
-                sq.enqueue(key);
+                sq.push(key);
                 ready_counts[key] = ndev;
                 cv.notify_all();
             }
@@ -225,22 +201,19 @@ public:
 
         {
             std::unique_lock<std::mutex> tb_lck(rc_mutex);
-            // while(sq.empty() || sq.front()!=key) {
-
-            //     cv.wait(tb_lck);
-            // }
-            cv.wait(tb_lck, [this, &key]{ return (!sq.empty()) && sq.front() == key;});
+            while(sq.empty() || sq.front()!=key) {
+                cv.wait(tb_lck);
+            }
+            // cv.wait(tb_lck, [this, &key]{ return (!sq.empty()) && sq.front() == key;});
         }
-        if (device_id == 0) {
-          std::cout << key << ":" << device_id << " to do reduce\n";
-        }
-        NCCLCHECK(ncclAllReduce((const void*)buff, (void*)buff, size, ncclFloat, ncclSum, comms[device_id], streams[device_id]));
-        CUDACHECK(cudaStreamSynchronize(streams[device_id]));
-        if (sq.front() == key) {
-            std::string tmp;
-            sq.dequeue(tmp);
-            // std::cout << tmp << " is dequeue, sq.size: "<< sq.size() << std::endl;
-            cv.notify_all();
+        NCCLCHECK(ncclAllReduce((const void*)buff, (void*)buff, size, ncclFloat, ncclSum, comms[device_id], stream));
+        // CUDACHECK(cudaStreamSynchronize(stream));
+        {
+            std::lock_guard<std::mutex> tb_lck(rc_mutex);
+            if ((!sq.empty()) && sq.front() == key) {
+                sq.pop();
+                cv.notify_all();
+            }
         }
     }
 };
@@ -271,99 +244,137 @@ class SyncBatchNormV3 : public Operator {
       CHECK_GE(req.size(), 1U);
       CHECK_EQ(req[syncbatchnormV3::kOut], kWriteTo);
     }
+    if (std::is_same<xpu, gpu>::value) {
+        Stream<xpu> *s = ctx.get_stream<xpu>();
+        MSHADOW_TYPE_SWITCH(in_data[syncbatchnormV3::kData].type_flag_, DType, {
+        const bool is_double = std::is_same<DType, double>::value;
+        CHECK_EQ(is_double, false)
+          << "Synchronized BatchNorm v3 does not support double-precision floating number yet...";
+        const real_t scale = static_cast<real_t>(in_data[syncbatchnormV3::kData].shape_[1]) /
+          static_cast<real_t>(in_data[syncbatchnormV3::kData].shape_.Size());
+        const size_t data_size = in_data[syncbatchnormV3::kData].Size();
 
-    Stream<xpu> *s = ctx.get_stream<xpu>();
-      MSHADOW_TYPE_SWITCH(in_data[syncbatchnormV3::kData].type_flag_, DType, {
-      const bool is_double = std::is_same<DType, double>::value;
-      CHECK_EQ(is_double, false)
-        << "Synchronized BatchNorm v3 does not support double-precision floating number yet...";
-      const real_t scale = static_cast<real_t>(in_data[syncbatchnormV3::kData].shape_[1]) /
-        static_cast<real_t>(in_data[syncbatchnormV3::kData].shape_.Size());
-      const size_t data_size = in_data[syncbatchnormV3::kData].Size();
-      Tensor<xpu, 4> data;
-      Tensor<xpu, 4> out;
-      Tensor<xpu, 1> workspace;
-      if (!std::is_same<DType, real_t>::value) {
-        workspace = ctx.requested[syncbatchnormV3::kTempSpace].get_space<xpu, 1>(
-          Shape1(data_size * 2), s);
-      }
-      if (in_data[syncbatchnormV3::kData].ndim() == 2) {
-        Shape<4> dshape = Shape4(in_data[syncbatchnormV3::kData].shape_[0],
-                                 in_data[syncbatchnormV3::kData].shape_[1], 1, 1);
-        if (std::is_same<DType, real_t>::value) {
-          data = in_data[syncbatchnormV3::kData].get_with_shape<xpu, 4, real_t>(dshape, s);
-          out = out_data[syncbatchnormV3::kOut].get_with_shape<xpu, 4, real_t>(dshape, s);
-        } else {
-          data = Tensor<xpu, 4>(workspace.dptr_, dshape, s);
-          out = Tensor<xpu, 4>(workspace.dptr_ + data_size, dshape, s);
+        Tensor<xpu, 1> slope = in_data[syncbatchnormV3::kGamma].get<xpu, 1, real_t>(s);
+        Tensor<xpu, 1> bias = in_data[syncbatchnormV3::kBeta].get<xpu, 1, real_t>(s);
+        Tensor<xpu, 1> moving_mean = aux_states[syncbatchnormV3::kMovingMean].get<xpu, 1, real_t>(s);
+        Tensor<xpu, 1> moving_var = aux_states[syncbatchnormV3::kMovingVar].get<xpu, 1, real_t>(s);
+
+        Tensor<xpu, 4> data;
+        Tensor<xpu, 4> out;
+        Tensor<xpu, 1> workspace;
+        size_t total_workspace_size = 0;
+        if (ctx.is_train && !param_.use_global_stats) {
+          total_workspace_size += 2 * moving_mean.shape_[0];
         }
-      } else {
-        if (std::is_same<DType, real_t>::value) {
-          data = in_data[syncbatchnormV3::kData].get<xpu, 4, real_t>(s);
-          out = out_data[syncbatchnormV3::kOut].get<xpu, 4, real_t>(s);
-        } else {
+        if (!std::is_same<DType, real_t>::value) {
+          total_workspace_size += 2 * data_size;
+        }
+        if (total_workspace_size >0) {
+          workspace = ctx.requested[syncbatchnormV3::kTempSpace].get_space<xpu, 1>(
+            Shape1(total_workspace_size), s);
+        }
+        
+        size_t allocated_size = 0;
+
+        if (in_data[syncbatchnormV3::kData].ndim() == 2) {
           Shape<4> dshape = Shape4(in_data[syncbatchnormV3::kData].shape_[0],
-                                   in_data[syncbatchnormV3::kData].shape_[1],
-                                   in_data[syncbatchnormV3::kData].shape_[2],
-                                   in_data[syncbatchnormV3::kData].shape_[3]);
-          data = Tensor<xpu, 4>(workspace.dptr_, dshape, s);
-          out = Tensor<xpu, 4>(workspace.dptr_ + data_size, dshape, s);
+                                  in_data[syncbatchnormV3::kData].shape_[1], 1, 1);
+          if (std::is_same<DType, real_t>::value) {
+            data = in_data[syncbatchnormV3::kData].get_with_shape<xpu, 4, real_t>(dshape, s);
+            out = out_data[syncbatchnormV3::kOut].get_with_shape<xpu, 4, real_t>(dshape, s);
+          } else {
+            data = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
+            allocated_size += data_size;
+            out = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
+            allocated_size += data_size;
+          }
+        } else {
+          if (std::is_same<DType, real_t>::value) {
+            data = in_data[syncbatchnormV3::kData].get<xpu, 4, real_t>(s);
+            out = out_data[syncbatchnormV3::kOut].get<xpu, 4, real_t>(s);
+          } else {
+            Shape<4> dshape = Shape4(in_data[syncbatchnormV3::kData].shape_[0],
+                                    in_data[syncbatchnormV3::kData].shape_[1],
+                                    in_data[syncbatchnormV3::kData].shape_[2],
+                                    in_data[syncbatchnormV3::kData].shape_[3]);
+            data = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
+            allocated_size += data_size;
+            out = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
+            allocated_size += data_size;
+          }
         }
-      }
-      if (!std::is_same<DType, real_t>::value) {
-        Kernel<identity_with_cast, xpu>::Launch(
-          s, data.shape_.Size(), data.dptr_, in_data[syncbatchnormV3::kData].dptr<DType>());
-      }
-      Tensor<xpu, 1> slope = in_data[syncbatchnormV3::kGamma].get<xpu, 1, real_t>(s);
-      Tensor<xpu, 1> bias = in_data[syncbatchnormV3::kBeta].get<xpu, 1, real_t>(s);
-      Tensor<xpu, 1> moving_mean = aux_states[syncbatchnormV3::kMovingMean].get<xpu, 1, real_t>(s);
-      Tensor<xpu, 1> moving_var = aux_states[syncbatchnormV3::kMovingVar].get<xpu, 1, real_t>(s);
-  
-      if (param_.fix_gamma) slope = 1.f;
-  
-      // whether use global statistics
-      if (ctx.is_train && !param_.use_global_stats) {
+        if (!std::is_same<DType, real_t>::value) {
+          Kernel<identity_with_cast, xpu>::Launch(
+            s, data.shape_.Size(), data.dptr_, in_data[syncbatchnormV3::kData].dptr<DType>());
+        }
+        
+    
+        if (param_.fix_gamma) slope = 1.f;
+    
+        // whether use global statistics
+        if (ctx.is_train && !param_.use_global_stats) {
+          int device_id = ctx.run_ctx.ctx.dev_id;
+          cudaStream_t custream = mshadow::Stream<gpu>::GetStream(ctx.get_stream<gpu>());
+          static std::shared_ptr<Globalcomm> gc_ptr = singleton_sharedptr<Globalcomm>::getInstance(param_.ndev);
+          // to avoid repeat init check as much as possible
+          static thread_local bool inited = gc_ptr->init(device_id);
 
-        // std::cout << param_.key << " ctx device id:" << ctx.run_ctx.ctx.dev_id << std::endl;
-        int device_id = ctx.run_ctx.ctx.dev_id;
-        static std::shared_ptr<Globalcomm> gc_ptr = singleton_sharedptr<Globalcomm>::getInstance(param_.ndev);
-        gc_ptr->init(device_id);
+          Shape<1> dshape = Shape1(moving_mean.shape_[0]);
+          Tensor<xpu, 1> tmpmean = Tensor<xpu, 1>(workspace.dptr_ + allocated_size, dshape, s);
+          allocated_size += moving_mean.shape_[0];
+          Tensor<xpu, 1> tmpvar = Tensor<xpu, 1>(workspace.dptr_ + allocated_size, dshape, s);
+          allocated_size += moving_mean.shape_[0];
 
-        // get the mean and var
-        Tensor<xpu, 1> mean = out_data[syncbatchnormV3::kMean].get<xpu, 1, real_t>(s);
-        Tensor<xpu, 1> var = out_data[syncbatchnormV3::kVar].get<xpu, 1, real_t>(s);
-        CHECK(req[syncbatchnormV3::kMean] == kNullOp || req[syncbatchnormV3::kMean] == kWriteTo);
-        CHECK(req[syncbatchnormV3::kVar] == kNullOp || req[syncbatchnormV3::kVar] == kWriteTo);
-        // E(x) and E(x^2)
-        mean = scale * sumall_except_dim<1>(data);
-        var = scale * sumall_except_dim<1>(F<mshadow_op::square>(data));
+          // get the mean and var
+          Tensor<xpu, 1> mean = out_data[syncbatchnormV3::kMean].get<xpu, 1, real_t>(s);
+          Tensor<xpu, 1> var = out_data[syncbatchnormV3::kVar].get<xpu, 1, real_t>(s);
+          CHECK(req[syncbatchnormV3::kMean] == kNullOp || req[syncbatchnormV3::kMean] == kWriteTo);
+          CHECK(req[syncbatchnormV3::kVar] == kNullOp || req[syncbatchnormV3::kVar] == kWriteTo);
+          // E(x) and E(x^2)
+          tmpmean = scale * sumall_except_dim<1>(data);
+          tmpvar = scale * sumall_except_dim<1>(F<mshadow_op::square>(data));
+          // if (param_.debug) {
+          //   print_result<float>(mean.dptr_, mean.shape_.Size(), param_.key + "_mean" + std::to_string(device_id));
+          //   print_result<float>(var.dptr_, mean.shape_.Size(), param_.key + "_var" + std::to_string(device_id));
+          // }
 
-        // do reduce
-        gc_ptr->reduce(mean.dptr_, mean.shape_.Size(), param_.key + "_mean", device_id);
-        gc_ptr->reduce(var.dptr_, var.shape_.Size(), param_.key + "_var", device_id);
+          // assert(mean.CheckContiguous() == true && var.CheckContiguous() == true);
+          // do reduce
+          // gc_ptr->reduce(mean.dptr_, mean.shape_.Size(), param_.key + "_mean", device_id, custream);
+          // gc_ptr->reduce(var.dptr_, var.shape_.Size(), param_.key + "_var", device_id, custream);
 
+          gc_ptr->reduce(tmpmean.dptr_, mean.shape_.Size() + var.shape_.Size(), param_.key + "_mean_var", device_id, custream);
+          // static const ScalarExp<real_t> tmp_t_expr(real_t(1.f/param_.ndev));
+          mean = (1.f/param_.ndev) * tmpmean;
+          var = (1.f/param_.ndev) * tmpvar;
 
-        mean = (1.f/param_.ndev) * mean;
-        var = (1.f/param_.ndev) * var;
+          if (param_.debug && device_id == 0) {
+            print_result<float>(mean.dptr_, mean.shape_.Size(), param_.key + "_mean");
+            print_result<float>(var.dptr_, mean.shape_.Size(), param_.key + "_var");
+          }
 
-  
-        var = var-F<mshadow_op::square>(mean);
-        Assign(out, req[syncbatchnormV3::kOut], broadcast<1>(slope, out.shape_) *
-               (data - broadcast<1>(mean, data.shape_)) /
-               F<mshadow_op::square_root>(broadcast<1>(var + param_.eps, data.shape_)) +
-               broadcast<1>(bias, out.shape_));
-      } else {
-        Assign(out, req[syncbatchnormV3::kOut], broadcast<1>(slope /
-                                            F<mshadow_op::square_root>(moving_var + param_.eps),
-                                            data.shape_) * data +
-               broadcast<1>(bias - (slope * moving_mean) /
-                            F<mshadow_op::square_root>(moving_var + param_.eps), data.shape_));
-      }
-      if (!std::is_same<DType, real_t>::value) {
-        Kernel<identity_with_cast, xpu>::Launch(
-          s, out.shape_.Size(), out_data[syncbatchnormV3::kOut].dptr<DType>(), out.dptr_);
-      }
-    });
+    
+          var = var-F<mshadow_op::square>(mean);
+          Assign(out, req[syncbatchnormV3::kOut], broadcast<1>(slope, out.shape_) *
+                (data - broadcast<1>(mean, data.shape_)) /
+                F<mshadow_op::square_root>(broadcast<1>(var + param_.eps, data.shape_)) +
+                broadcast<1>(bias, out.shape_));
+        } else {
+          Assign(out, req[syncbatchnormV3::kOut], broadcast<1>(slope /
+                                              F<mshadow_op::square_root>(moving_var + param_.eps),
+                                              data.shape_) * data +
+                broadcast<1>(bias - (slope * moving_mean) /
+                              F<mshadow_op::square_root>(moving_var + param_.eps), data.shape_));
+        }
+        if (!std::is_same<DType, real_t>::value) {
+          Kernel<identity_with_cast, xpu>::Launch(
+            s, out.shape_.Size(), out_data[syncbatchnormV3::kOut].dptr<DType>(), out.dptr_);
+        }
+      });
+    }
+    else {
+      LOG(FATAL) << "SyncBN v3 only support multipe GPU in train mode.";
+    }
   }
 
   virtual void Backward(const OpContext &ctx,
@@ -382,145 +393,175 @@ class SyncBatchNormV3 : public Operator {
     CHECK_EQ(out_data.size(), 3U);
     CHECK_EQ(in_grad.size(), 3U);
 
-    Stream<xpu> *s = ctx.get_stream<xpu>();
-    Tensor<xpu, 4> data, grad, grad_in;
-    Tensor<xpu, 1> workspace;
-    const size_t data_size = in_data[syncbatchnormV3::kData].Size();
-    MSHADOW_TYPE_SWITCH(in_data[syncbatchnormV3::kData].type_flag_, DType, {
-      const bool is_double = std::is_same<DType, double>::value;
-      CHECK_EQ(is_double, false)
-        << "Synchronized BatchNorm does not support double-precision floating number yet...";
-      size_t total_workspace_size = 0;
+    if (std::is_same<xpu, gpu>::value) {
+      Stream<xpu> *s = ctx.get_stream<xpu>();
+      Tensor<xpu, 4> data, grad, grad_in;
+      Tensor<xpu, 1> workspace;
+      const size_t data_size = in_data[syncbatchnormV3::kData].Size();
+      MSHADOW_TYPE_SWITCH(in_data[syncbatchnormV3::kData].type_flag_, DType, {
+        const bool is_double = std::is_same<DType, double>::value;
+        CHECK_EQ(is_double, false)
+          << "Synchronized BatchNorm does not support double-precision floating number yet...";
+        size_t total_workspace_size = 0;
 
-      Tensor<xpu, 1> mean = out_data[syncbatchnormV3::kMean].get<xpu, 1, real_t>(s);
-      Tensor<xpu, 1> var = out_data[syncbatchnormV3::kVar].get<xpu, 1, real_t>(s);
-      Tensor<xpu, 1> slope = in_data[syncbatchnormV3::kGamma].get<xpu, 1, real_t>(s);
-      Tensor<xpu, 1> gslope = in_grad[syncbatchnormV3::kGamma].get<xpu, 1, real_t>(s);
-      Tensor<xpu, 1> gbias = in_grad[syncbatchnormV3::kBeta].get<xpu, 1, real_t>(s);
-      // update moving avg
-      Tensor<xpu, 1> moving_mean = aux_states[syncbatchnormV3::kMovingMean].get<xpu, 1, real_t>(s);
-      Tensor<xpu, 1> moving_var = aux_states[syncbatchnormV3::kMovingVar].get<xpu, 1, real_t>(s);
+        Tensor<xpu, 1> mean = out_data[syncbatchnormV3::kMean].get<xpu, 1, real_t>(s);
+        Tensor<xpu, 1> var = out_data[syncbatchnormV3::kVar].get<xpu, 1, real_t>(s);
+        Tensor<xpu, 1> slope = in_data[syncbatchnormV3::kGamma].get<xpu, 1, real_t>(s);
+        Tensor<xpu, 1> gslope = in_grad[syncbatchnormV3::kGamma].get<xpu, 1, real_t>(s);
+        Tensor<xpu, 1> gbias = in_grad[syncbatchnormV3::kBeta].get<xpu, 1, real_t>(s);
+        // update moving avg
+        Tensor<xpu, 1> moving_mean = aux_states[syncbatchnormV3::kMovingMean].get<xpu, 1, real_t>(s);
+        Tensor<xpu, 1> moving_var = aux_states[syncbatchnormV3::kMovingVar].get<xpu, 1, real_t>(s);
 
-      if (ctx.is_train && !param_.use_global_stats) {
-        total_workspace_size += 4 * mean.shape_[0];
-      }
-      if (!std::is_same<DType, real_t>::value) {
-        total_workspace_size += 3 * data_size;
-      }
-
-      workspace = ctx.requested[syncbatchnormV3::kTempSpace].get_space<xpu, 1>(
-                    mshadow::Shape1(total_workspace_size), s);
-      
-      const real_t scale = static_cast<real_t>(out_grad[syncbatchnormV3::kOut].shape_[1]) /
-        static_cast<real_t>(out_grad[syncbatchnormV3::kOut].shape_.Size());
-      if (in_data[syncbatchnormV3::kData].ndim() == 2) {
-        Shape<4> dshape = Shape4(out_grad[syncbatchnormV3::kOut].shape_[0],
-                                 out_grad[syncbatchnormV3::kOut].shape_[1], 1, 1);        
+        if (ctx.is_train && !param_.use_global_stats) {
+          total_workspace_size += 4 * mean.shape_[0];
+        }
         if (!std::is_same<DType, real_t>::value) {
-          real_t* starting_ptr = (ctx.is_train && !param_.use_global_stats) ?
-                                       workspace.dptr_ + 4 * mean.shape_[0] :
-                                       workspace.dptr_;
-          data = Tensor<xpu, 4>(starting_ptr, dshape, s);
-          grad = Tensor<xpu, 4>(starting_ptr + data_size, dshape, s);
-          grad_in = Tensor<xpu, 4>(starting_ptr + 2 * data_size, dshape, s);
-        } else {
-          data = in_data[syncbatchnormV3::kData].get_with_shape<xpu, 4, real_t>(dshape, s);
-          grad = out_grad[syncbatchnormV3::kOut].get_with_shape<xpu, 4, real_t>(dshape, s);
-          grad_in = in_grad[syncbatchnormV3::kData].get_with_shape<xpu, 4, real_t>(dshape, s);
+          total_workspace_size += 3 * data_size;
         }
-      } else {
-        Shape<4> dshape = Shape4(out_grad[syncbatchnormV3::kOut].shape_[0],
-                                 out_grad[syncbatchnormV3::kOut].shape_[1],
-                                 out_grad[syncbatchnormV3::kOut].shape_[2],
-                                 out_grad[syncbatchnormV3::kOut].shape_[3]);
+
+        workspace = ctx.requested[syncbatchnormV3::kTempSpace].get_space<xpu, 1>(
+                      mshadow::Shape1(total_workspace_size), s);
+        
+        size_t allocated_size = 0;
+        
+        const real_t scale = static_cast<real_t>(out_grad[syncbatchnormV3::kOut].shape_[1]) /
+          static_cast<real_t>(out_grad[syncbatchnormV3::kOut].shape_.Size());
+        if (in_data[syncbatchnormV3::kData].ndim() == 2) {
+          Shape<4> dshape = Shape4(out_grad[syncbatchnormV3::kOut].shape_[0],
+                                  out_grad[syncbatchnormV3::kOut].shape_[1], 1, 1);        
+          if (!std::is_same<DType, real_t>::value) {
+            // real_t* starting_ptr = (ctx.is_train && !param_.use_global_stats) ?
+            //                             workspace.dptr_ + 4 * mean.shape_[0] :
+            //                             workspace.dptr_;
+            data = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
+            allocated_size += data_size;
+            grad = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
+            allocated_size += data_size;
+            grad_in = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
+            allocated_size += data_size;
+          } else {
+            data = in_data[syncbatchnormV3::kData].get_with_shape<xpu, 4, real_t>(dshape, s);
+            grad = out_grad[syncbatchnormV3::kOut].get_with_shape<xpu, 4, real_t>(dshape, s);
+            grad_in = in_grad[syncbatchnormV3::kData].get_with_shape<xpu, 4, real_t>(dshape, s);
+          }
+        } else {
+          Shape<4> dshape = Shape4(out_grad[syncbatchnormV3::kOut].shape_[0],
+                                  out_grad[syncbatchnormV3::kOut].shape_[1],
+                                  out_grad[syncbatchnormV3::kOut].shape_[2],
+                                  out_grad[syncbatchnormV3::kOut].shape_[3]);
+          if (!std::is_same<DType, real_t>::value) {
+            // real_t* starting_ptr = (ctx.is_train && !param_.use_global_stats) ?
+            //                             workspace.dptr_ + 4 * mean.shape_[0] :
+            //                             workspace.dptr_;
+            data = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
+            allocated_size += data_size;
+            grad = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
+            allocated_size += data_size;
+            grad_in = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
+            allocated_size += data_size;
+          } else {
+            data = in_data[syncbatchnormV3::kData].get<xpu, 4, real_t>(s);
+            grad = out_grad[syncbatchnormV3::kOut].get<xpu, 4, real_t>(s);
+            grad_in = in_grad[syncbatchnormV3::kData].get<xpu, 4, real_t>(s);
+          }
+        }
+
         if (!std::is_same<DType, real_t>::value) {
-          real_t* starting_ptr = (ctx.is_train && !param_.use_global_stats) ?
-                                       workspace.dptr_ + 4 * mean.shape_[0] :
-                                       workspace.dptr_;
-          data = Tensor<xpu, 4>(starting_ptr, dshape, s);
-          grad = Tensor<xpu, 4>(starting_ptr + data_size, dshape, s);
-          grad_in = Tensor<xpu, 4>(starting_ptr + 2 * data_size, dshape, s);
-        } else {
-          data = in_data[syncbatchnormV3::kData].get<xpu, 4, real_t>(s);
-          grad = out_grad[syncbatchnormV3::kOut].get<xpu, 4, real_t>(s);
-          grad_in = in_grad[syncbatchnormV3::kData].get<xpu, 4, real_t>(s);
+          Kernel<identity_with_cast, xpu>::Launch(
+            s, data.shape_.Size(), data.dptr_, in_data[syncbatchnormV3::kData].dptr<DType>());
+          Kernel<identity_with_cast, xpu>::Launch(
+            s, grad.shape_.Size(), grad.dptr_, out_grad[syncbatchnormV3::kOut].dptr<DType>());
         }
-      }
 
-      if (!std::is_same<DType, real_t>::value) {
-        Kernel<identity_with_cast, xpu>::Launch(
-          s, data.shape_.Size(), data.dptr_, in_data[syncbatchnormV3::kData].dptr<DType>());
-        Kernel<identity_with_cast, xpu>::Launch(
-          s, grad.shape_.Size(), grad.dptr_, out_grad[syncbatchnormV3::kOut].dptr<DType>());
-      }
+        if (param_.fix_gamma) slope = 1.f;
 
-      if (param_.fix_gamma) slope = 1.f;
+        if (ctx.is_train && !param_.use_global_stats) {
 
-      if (ctx.is_train && !param_.use_global_stats) {
+          int device_id = ctx.run_ctx.ctx.dev_id;
+          cudaStream_t custream = mshadow::Stream<gpu>::GetStream(ctx.get_stream<gpu>());
+          static std::shared_ptr<Globalcomm> gc_ptr = singleton_sharedptr<Globalcomm>::getInstance(param_.ndev);
+          // to avoid repeat init check as much as possible
+          static thread_local bool inited = gc_ptr->init(device_id);
 
-        int device_id = ctx.run_ctx.ctx.dev_id;
-        static std::shared_ptr<Globalcomm> gc_ptr = singleton_sharedptr<Globalcomm>::getInstance(param_.ndev);
-        gc_ptr->init(device_id);
+          Shape<1> dshape = Shape1(mean.shape_[0]);
+          Tensor<xpu, 1> gmean = Tensor<xpu, 1>(workspace.dptr_ + allocated_size, dshape, s);
+          allocated_size += mean.shape_[0];
+          Tensor<xpu, 1> gvar = Tensor<xpu, 1>(workspace.dptr_ + allocated_size, dshape, s);
+          allocated_size += mean.shape_[0];
 
-        Shape<1> dshape = Shape1(mean.shape_[0]);
-        Tensor<xpu, 1> gmean = Tensor<xpu, 1>(workspace.dptr_, dshape, s);
-        Tensor<xpu, 1> gvar = Tensor<xpu, 1>(workspace.dptr_ + mean.shape_[0], dshape, s);
+          moving_mean = moving_mean * param_.momentum + mean * (1 - param_.momentum);
+          moving_var = moving_var * param_.momentum + var * (1 - param_.momentum);
+          // cal
+          Tensor<xpu, 1> sumGrad = Tensor<xpu, 1>(workspace.dptr_ + allocated_size, dshape, s);
+          allocated_size += mean.shape_[0];
+          Tensor<xpu, 1> sumProd = Tensor<xpu, 1>(workspace.dptr_ + allocated_size, dshape, s);
+          allocated_size += mean.shape_[0];
 
-        moving_mean = moving_mean * param_.momentum + mean * (1 - param_.momentum);
-        moving_var = moving_var * param_.momentum + var * (1 - param_.momentum);
-        // cal
-        Tensor<xpu, 1> sumGrad = Tensor<xpu, 1>(workspace.dptr_ + 2 * mean.shape_[0], dshape, s);
-        Tensor<xpu, 1> sumProd = Tensor<xpu, 1>(workspace.dptr_ + 3 * mean.shape_[0], dshape, s);
-        sumGrad = sumall_except_dim<1>(grad);
-        sumProd = sumall_except_dim<1>(grad * (data - broadcast<1>(mean, data.shape_)));
+          sumGrad = sumall_except_dim<1>(grad);
+          sumProd = sumall_except_dim<1>(grad * (data - broadcast<1>(mean, data.shape_)));
 
-        // do reduce
-        gc_ptr->reduce(sumGrad.dptr_, sumGrad.shape_.Size(), param_.key + "_grad", device_id);
-        gc_ptr->reduce(sumProd.dptr_, sumProd.shape_.Size(), param_.key + "_prod", device_id);
+          // if (param_.debug) {
+          //   print_result<float>(sumGrad.dptr_, sumGrad.shape_.Size(), param_.key + "_grad" + std::to_string(device_id));
+          //   print_result<float>(sumProd.dptr_, sumProd.shape_.Size(), param_.key + "_prod" + std::to_string(device_id));
+          // }
 
-        sumGrad = (1.f/param_.ndev) * sumGrad;
-        sumProd = (1.f/param_.ndev) * sumProd;
+          // do reduce
+          // gc_ptr->reduce(sumGrad.dptr_, sumGrad.shape_.Size(), param_.key + "_grad", device_id, custream);
+          // gc_ptr->reduce(sumProd.dptr_, sumProd.shape_.Size(), param_.key + "_prod", device_id, custream);
+          gc_ptr->reduce(sumGrad.dptr_, sumGrad.shape_.Size() + sumProd.shape_.Size(), param_.key + "_grad_prod", device_id, custream);
+          // static const ScalarExp<real_t> tmp_t_expr(real_t(1.f/param_.ndev));
+          sumGrad = (1.f/param_.ndev) * sumGrad;
+          sumProd = (1.f/param_.ndev) * sumProd;
+          if (param_.debug && device_id == 0) {
+            print_result<float>(sumGrad.dptr_, sumGrad.shape_.Size(), param_.key + "_grad");
+            print_result<float>(sumProd.dptr_, sumProd.shape_.Size(), param_.key + "_prod");
+          }
+          
+          gvar = -0.5f * sumProd * slope * F<mshadow_op::power>(var + param_.eps, -1.5f);
+          gmean = sumGrad * slope;
+          gmean *= -1.0f / F<mshadow_op::square_root>(var + param_.eps);
+          // NOTICE: sum (x_i - mu_B) = 0, so the second term for dl/dmu_B can be ignored
 
+          // assign
+          if (!param_.fix_gamma) {
+            Assign(gslope, req[syncbatchnormV3::kGamma], sumall_except_dim<1>(grad * (data - broadcast<1>(mean, data.shape_)) /
+                      F<mshadow_op::square_root>(broadcast<1>(var + param_.eps, data.shape_)))); // piggyback executor AllReduce for multi-dev summation
+          } else {
+            Assign(gslope, req[syncbatchnormV3::kGamma], 0.0f);
+          }
+          Assign(grad_in, req[syncbatchnormV3::kData],
+                (grad * broadcast<1>(slope, data.shape_)) *
+                  broadcast<1>(1.0f / F<mshadow_op::square_root>(var + param_.eps), data.shape_) +
+                broadcast<1>(gvar, data.shape_) *
+                  scale * 2.0f * (data - broadcast<1>(mean, data.shape_)) +
+                broadcast<1>(gmean, data.shape_) * scale);
+          Assign(gbias, req[syncbatchnormV3::kBeta], sumall_except_dim<1>(grad)); // piggyback executor AllReduce for multi-dev summation
 
-        gvar = -0.5f * sumProd * slope * F<mshadow_op::power>(var + param_.eps, -1.5f);
-        gmean = sumGrad * slope;
-        gmean *= -1.0f / F<mshadow_op::square_root>(var + param_.eps);
-        // NOTICE: sum (x_i - mu_B) = 0, so the second term for dl/dmu_B can be ignored
-
-        // assign
-        if (!param_.fix_gamma) {
-          Assign(gslope, req[syncbatchnormV3::kGamma], sumall_except_dim<1>(grad * (data - broadcast<1>(mean, data.shape_)) /
-                     F<mshadow_op::square_root>(broadcast<1>(var + param_.eps, data.shape_)))); // piggyback executor AllReduce for multi-dev summation
         } else {
-          Assign(gslope, req[syncbatchnormV3::kGamma], 0.0f);
+          // use global statistics with freeze moving mean and var.
+          if (!param_.fix_gamma) {
+            Assign(gslope, req[syncbatchnormV3::kGamma],
+                  sumall_except_dim<1>(
+                    grad * (data - broadcast<1>(moving_mean, data.shape_)) /
+                    F<mshadow_op::square_root>(broadcast<1>(moving_var + param_.eps, data.shape_))));
+          } else {
+            Assign(gslope, req[syncbatchnormV3::kGamma], 0.0f);
+          }
+          Assign(gbias, req[syncbatchnormV3::kBeta], sumall_except_dim<1>(grad));
+          Assign(grad_in, req[syncbatchnormV3::kData], (grad * broadcast<1>(slope, data.shape_)) *
+                broadcast<1>(
+                  1.0f / F<mshadow_op::square_root>(moving_var + param_.eps), data.shape_));
         }
-        Assign(grad_in, req[syncbatchnormV3::kData],
-               (grad * broadcast<1>(slope, data.shape_)) *
-                 broadcast<1>(1.0f / F<mshadow_op::square_root>(var + param_.eps), data.shape_) +
-               broadcast<1>(gvar, data.shape_) *
-                 scale * 2.0f * (data - broadcast<1>(mean, data.shape_)) +
-               broadcast<1>(gmean, data.shape_) * scale);
-        Assign(gbias, req[syncbatchnormV3::kBeta], sumall_except_dim<1>(grad)); // piggyback executor AllReduce for multi-dev summation
-      } else {
-        // use global statistics with freeze moving mean and var.
-        if (!param_.fix_gamma) {
-          Assign(gslope, req[syncbatchnormV3::kGamma],
-                 sumall_except_dim<1>(
-                   grad * (data - broadcast<1>(moving_mean, data.shape_)) /
-                   F<mshadow_op::square_root>(broadcast<1>(moving_var + param_.eps, data.shape_))));
-        } else {
-          Assign(gslope, req[syncbatchnormV3::kGamma], 0.0f);
+        if (!std::is_same<DType, real_t>::value) {
+          Kernel<identity_with_cast, xpu>::Launch(
+            s, grad_in.shape_.Size(), in_grad[syncbatchnormV3::kData].dptr<DType>(), grad_in.dptr_);
         }
-        Assign(gbias, req[syncbatchnormV3::kBeta], sumall_except_dim<1>(grad));
-        Assign(grad_in, req[syncbatchnormV3::kData], (grad * broadcast<1>(slope, data.shape_)) *
-               broadcast<1>(
-                 1.0f / F<mshadow_op::square_root>(moving_var + param_.eps), data.shape_));
-      }
-      if (!std::is_same<DType, real_t>::value) {
-        Kernel<identity_with_cast, xpu>::Launch(
-          s, grad_in.shape_.Size(), in_grad[syncbatchnormV3::kData].dptr<DType>(), grad_in.dptr_);
-      }
-    });
+      });
+    }
+    else {
+      LOG(FATAL) << "SyncBN v3 only support multipe GPU in train mode.";
+    }
   } 
 
  private:

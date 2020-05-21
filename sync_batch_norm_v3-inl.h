@@ -35,10 +35,8 @@
 #include <string>
 #include <utility>
 #include <queue>
-// #include "../operator_common.h"
-// #include "../mshadow_op.h"
-#include "operator_common.h"
-#include "mshadow_op.h"
+#include "../operator_common.h"
+#include "../mshadow_op.h"
 
 #include "nccl.h"
 
@@ -151,7 +149,6 @@ public:
         ncclGetUniqueId(&uid);
         inited = std::vector<bool>(ndev, false);
         comms = std::vector<ncclComm_t>(ndev);
-        // streams = std::vector<cudaStream_t>(ndev);
         mutexs = new std::mutex[ndev];
     }
     
@@ -164,20 +161,11 @@ public:
         // delete[] mutexs;
     }
 
-    int get_device_id() {
-        int device_id;
-        CUDACHECK(cudaGetDevice(&device_id));
-        return device_id;
-    }
-
     bool init(int device_id) {
         if (device_id == 0) std::cout << "check init\n";
-        // int device_id = get_device_id();
         std::lock_guard<std::mutex> lck(mutexs[device_id]);
         if (!inited[device_id]) {
             std::cout << "comm init: " << device_id << "/"<< ndev << std::endl;
-            // CUDACHECK(cudaSetDevice(device_id));
-            // CUDACHECK(cudaStreamCreate(&streams[device_id]));
             NCCLCHECK(ncclCommInitRank(&comms[device_id], ndev, uid, device_id));
             inited[device_id] = true;
         }
@@ -185,7 +173,6 @@ public:
     }
 
     void reduce(float* buff, int size, std::string key, int device_id, cudaStream_t stream) {
-        // int device_id = get_device_id();
         // be care of the scope of mutex, ensure rc_mutex is unlocked, when call notify all
         {
             std::lock_guard<std::mutex> tb_lck(rc_mutex);
@@ -431,9 +418,6 @@ class SyncBatchNormV3 : public Operator {
           Shape<4> dshape = Shape4(out_grad[syncbatchnormV3::kOut].shape_[0],
                                   out_grad[syncbatchnormV3::kOut].shape_[1], 1, 1);        
           if (!std::is_same<DType, real_t>::value) {
-            // real_t* starting_ptr = (ctx.is_train && !param_.use_global_stats) ?
-            //                             workspace.dptr_ + 4 * mean.shape_[0] :
-            //                             workspace.dptr_;
             data = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
             allocated_size += data_size;
             grad = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
@@ -451,9 +435,6 @@ class SyncBatchNormV3 : public Operator {
                                   out_grad[syncbatchnormV3::kOut].shape_[2],
                                   out_grad[syncbatchnormV3::kOut].shape_[3]);
           if (!std::is_same<DType, real_t>::value) {
-            // real_t* starting_ptr = (ctx.is_train && !param_.use_global_stats) ?
-            //                             workspace.dptr_ + 4 * mean.shape_[0] :
-            //                             workspace.dptr_;
             data = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
             allocated_size += data_size;
             grad = Tensor<xpu, 4>(workspace.dptr_ + allocated_size, dshape, s);
@@ -501,16 +482,7 @@ class SyncBatchNormV3 : public Operator {
           sumGrad = sumall_except_dim<1>(grad);
           sumProd = sumall_except_dim<1>(grad * (data - broadcast<1>(mean, data.shape_)));
 
-          // if (param_.debug) {
-          //   print_result<float>(sumGrad.dptr_, sumGrad.shape_.Size(), param_.key + "_grad" + std::to_string(device_id));
-          //   print_result<float>(sumProd.dptr_, sumProd.shape_.Size(), param_.key + "_prod" + std::to_string(device_id));
-          // }
-
-          // do reduce
-          // gc_ptr->reduce(sumGrad.dptr_, sumGrad.shape_.Size(), param_.key + "_grad", device_id, custream);
-          // gc_ptr->reduce(sumProd.dptr_, sumProd.shape_.Size(), param_.key + "_prod", device_id, custream);
           gc_ptr->reduce(sumGrad.dptr_, sumGrad.shape_.Size() + sumProd.shape_.Size(), param_.key + "_grad_prod", device_id, custream);
-          // static const ScalarExp<real_t> tmp_t_expr(real_t(1.f/param_.ndev));
           sumGrad = (1.f/param_.ndev) * sumGrad;
           sumProd = (1.f/param_.ndev) * sumProd;
           if (param_.debug && device_id == 0) {
